@@ -1,7 +1,7 @@
-import os
+import streamlit as st
 import numpy as np
 import faiss
-import gradio as gr
+from io import BytesIO
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -18,47 +18,77 @@ TOP_K = 3
 
 
 # ============================================================
+# Page Configuration
+# ============================================================
+
+st.set_page_config(
+    page_title="AI Document Search using RAG",
+    page_icon="🤖",
+    layout="wide"
+)
+
+
+# ============================================================
+# Title
+# ============================================================
+
+st.title("🤖 AI-Powered Document Search using RAG")
+
+st.write(
+    "Upload a PDF, ask a question, and get an AI-generated "
+    "answer based only on the document."
+)
+
+
+# ============================================================
 # Gemini API
 # ============================================================
 
-api_key = os.getenv("GEMINI_API_KEY")
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    client = genai.Client(api_key=api_key)
 
-if not api_key:
-    raise ValueError("GEMINI_API_KEY environment variable is not set.")
-
-client = genai.Client(api_key=api_key)
+except Exception:
+    st.error("Gemini API key is not configured.")
+    st.stop()
 
 
 # ============================================================
 # Embedding Model
 # ============================================================
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+@st.cache_resource
+def load_embedding_model():
+
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+model = load_embedding_model()
 
 
 # ============================================================
 # Build Document Index
 # ============================================================
 
-def build_index(pdf_path):
+def build_index(pdf_bytes):
 
-    if not pdf_path:
-        return None, [], "Please upload a PDF document."
-
-    reader = PdfReader(pdf_path)
+    reader = PdfReader(BytesIO(pdf_bytes))
 
     text = ""
 
     for page in reader.pages:
+
         page_text = page.extract_text()
 
         if page_text:
             text += page_text + "\n"
 
     if not text.strip():
-        return None, [], "Could not extract text from the PDF."
+
+        return None, []
 
     # Create chunks
+
     chunks = []
 
     start = 0
@@ -70,11 +100,13 @@ def build_index(pdf_path):
         chunk = text[start:end]
 
         if chunk.strip():
+
             chunks.append(chunk.strip())
 
         start += CHUNK_SIZE - CHUNK_OVERLAP
 
     # Create embeddings
+
     embeddings = model.encode(chunks)
 
     embedding_matrix = np.array(
@@ -82,47 +114,102 @@ def build_index(pdf_path):
     ).astype("float32")
 
     # Create FAISS index
+
     dimension = embedding_matrix.shape[1]
 
     index = faiss.IndexFlatL2(dimension)
 
     index.add(embedding_matrix)
 
-    return (
-        index,
-        chunks,
-        f"✅ Document processed successfully! {len(chunks)} chunks created."
-    )
+    return index, chunks
 
 
 # ============================================================
-# RAG Question Answering
+# PDF Upload
 # ============================================================
 
-def rag_interface(question, index, chunks):
+uploaded_file = st.file_uploader(
+    "📄 Upload PDF Document",
+    type=["pdf"]
+)
 
-    if not question.strip():
-        return "Please enter a question.", ""
 
-    if index is None or not chunks:
-        return "Please upload and process a PDF first.", ""
+# ============================================================
+# Process PDF
+# ============================================================
 
-    # Convert question into embedding
-    query_embedding = model.encode([question])
+if uploaded_file:
 
-    # Retrieve relevant chunks
-    distances, indices = index.search(
-        np.array(query_embedding).astype("float32"),
-        k=min(TOP_K, len(chunks))
-    )
+    if st.button("⚙️ Process Document"):
 
-    # Create context
-    context = "\n\n".join(
-        [chunks[idx] for idx in indices[0]]
-    )
+        with st.spinner("Processing document..."):
 
-    # Prompt
-    prompt = f"""
+            index, chunks = build_index(
+                uploaded_file.getvalue()
+            )
+
+            st.session_state["index"] = index
+            st.session_state["chunks"] = chunks
+
+        st.success(
+            f"✅ Document processed successfully! "
+            f"{len(chunks)} chunks created."
+        )
+
+
+# ============================================================
+# Question Answering
+# ============================================================
+
+question = st.text_input(
+    "🔍 Ask a question about your document",
+    placeholder="Example: What is blockchain?"
+)
+
+
+if st.button("Ask Question"):
+
+    if "index" not in st.session_state:
+
+        st.warning(
+            "Please upload and process a PDF first."
+        )
+
+    elif not question.strip():
+
+        st.warning(
+            "Please enter a question."
+        )
+
+    else:
+
+        index = st.session_state["index"]
+        chunks = st.session_state["chunks"]
+
+        with st.spinner("Searching document and generating answer..."):
+
+            # Convert question into embedding
+
+            query_embedding = model.encode(
+                [question]
+            )
+
+            # Retrieve relevant chunks
+
+            distances, indices = index.search(
+                np.array(query_embedding).astype("float32"),
+                k=min(TOP_K, len(chunks))
+            )
+
+            # Create context
+
+            context = "\n\n".join(
+                [chunks[idx] for idx in indices[0]]
+            )
+
+            # Prompt
+
+            prompt = f"""
 You are a document question-answering assistant.
 
 Answer the question using ONLY the information provided in the context.
@@ -143,101 +230,29 @@ Question:
 Answer:
 """
 
-    # Generate answer
-    response = client.models.generate_content(
-        model="gemini-3.1-flash-lite",
-        contents=prompt
+            # Generate answer
+
+            response = client.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=prompt
+            )
+
+        # Display answer
+
+        st.subheader("🤖 AI Answer")
+
+        st.write(response.text)
+
+        # Display sources
+
+        st.subheader("📚 Retrieved Sources")
+
+        for i, idx in enumerate(indices[0]):
+
+            with st.expander(
+                f"Source {i + 1}"
+            ):
+
+                st.write(
+                    chunks[idx][:500]
     )
-
-    # Retrieved sources
-    sources = ""
-
-    for i, idx in enumerate(indices[0]):
-
-        sources += f"--- Source {i + 1} ---\n"
-        sources += chunks[idx][:500]
-        sources += "\n\n"
-
-    return response.text, sources
-
-
-# ============================================================
-# Gradio Interface
-# ============================================================
-
-with gr.Blocks() as demo:
-
-    gr.Markdown(
-        "# 🤖 AI-Powered Document Search using RAG"
-    )
-
-    gr.Markdown(
-        "Upload a PDF, ask a question, and get an AI-generated "
-        "answer based on the document."
-    )
-
-    pdf_file = gr.File(
-        label="📄 Upload PDF Document",
-        file_types=[".pdf"],
-        type="filepath"
-    )
-
-    process_button = gr.Button(
-        "⚙️ Process Document"
-    )
-
-    status = gr.Textbox(
-        label="Document Status"
-    )
-
-    index_state = gr.State()
-    chunks_state = gr.State()
-
-    process_button.click(
-        fn=build_index,
-        inputs=pdf_file,
-        outputs=[
-            index_state,
-            chunks_state,
-            status
-        ]
-    )
-
-    question = gr.Textbox(
-        label="Ask a question about your document",
-        placeholder="Example: What is blockchain?"
-    )
-
-    ask_button = gr.Button(
-        "🔍 Ask Question"
-    )
-
-    answer = gr.Textbox(
-        label="🤖 AI Answer",
-        lines=5
-    )
-
-    sources = gr.Textbox(
-        label="📚 Retrieved Sources",
-        lines=12
-    )
-
-    ask_button.click(
-        fn=rag_interface,
-        inputs=[
-            question,
-            index_state,
-            chunks_state
-        ],
-        outputs=[
-            answer,
-            sources
-        ]
-    )
-
-
-# ============================================================
-# Launch
-# ============================================================
-
-demo.launch()
