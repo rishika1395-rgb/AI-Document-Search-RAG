@@ -23,8 +23,7 @@ TOP_K = 3
 
 st.set_page_config(
     page_title="AI Document Search using RAG",
-    page_icon="🤖",
-    layout="wide"
+    page_icon="🤖"
 )
 
 
@@ -59,7 +58,6 @@ except Exception:
 
 @st.cache_resource
 def load_embedding_model():
-
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
@@ -67,10 +65,10 @@ model = load_embedding_model()
 
 
 # ============================================================
-# Build Document Index
+# Process PDF
 # ============================================================
 
-def build_index(pdf_bytes):
+def process_pdf(pdf_bytes):
 
     reader = PdfReader(BytesIO(pdf_bytes))
 
@@ -84,8 +82,7 @@ def build_index(pdf_bytes):
             text += page_text + "\n"
 
     if not text.strip():
-
-        return None, []
+        return [], None
 
     # Create chunks
 
@@ -100,7 +97,6 @@ def build_index(pdf_bytes):
         chunk = text[start:end]
 
         if chunk.strip():
-
             chunks.append(chunk.strip())
 
         start += CHUNK_SIZE - CHUNK_OVERLAP
@@ -113,15 +109,7 @@ def build_index(pdf_bytes):
         embeddings
     ).astype("float32")
 
-    # Create FAISS index
-
-    dimension = embedding_matrix.shape[1]
-
-    index = faiss.IndexFlatL2(dimension)
-
-    index.add(embedding_matrix)
-
-    return index, chunks
+    return chunks, embedding_matrix
 
 
 # ============================================================
@@ -135,7 +123,7 @@ uploaded_file = st.file_uploader(
 
 
 # ============================================================
-# Process PDF
+# Process Button
 # ============================================================
 
 if uploaded_file:
@@ -144,21 +132,29 @@ if uploaded_file:
 
         with st.spinner("Processing document..."):
 
-            index, chunks = build_index(
+            chunks, embeddings = process_pdf(
                 uploaded_file.getvalue()
             )
 
-            st.session_state["index"] = index
-            st.session_state["chunks"] = chunks
+            if not chunks:
 
-        st.success(
-            f"✅ Document processed successfully! "
-            f"{len(chunks)} chunks created."
-        )
+                st.error(
+                    "Could not extract text from this PDF."
+                )
+
+            else:
+
+                st.session_state["chunks"] = chunks
+                st.session_state["embeddings"] = embeddings
+
+                st.success(
+                    f"✅ Document processed successfully! "
+                    f"{len(chunks)} chunks created."
+                )
 
 
 # ============================================================
-# Question Answering
+# Question
 # ============================================================
 
 question = st.text_input(
@@ -167,9 +163,13 @@ question = st.text_input(
 )
 
 
+# ============================================================
+# Ask Question
+# ============================================================
+
 if st.button("Ask Question"):
 
-    if "index" not in st.session_state:
+    if "chunks" not in st.session_state:
 
         st.warning(
             "Please upload and process a PDF first."
@@ -183,10 +183,20 @@ if st.button("Ask Question"):
 
     else:
 
-        index = st.session_state["index"]
         chunks = st.session_state["chunks"]
+        embeddings = st.session_state["embeddings"]
 
-        with st.spinner("Searching document and generating answer..."):
+        with st.spinner(
+            "Searching document and generating answer..."
+        ):
+
+            # Create FAISS index from stored embeddings
+
+            dimension = embeddings.shape[1]
+
+            index = faiss.IndexFlatL2(dimension)
+
+            index.add(embeddings)
 
             # Convert question into embedding
 
@@ -194,10 +204,14 @@ if st.button("Ask Question"):
                 [question]
             )
 
+            query_embedding = np.array(
+                query_embedding
+            ).astype("float32")
+
             # Retrieve relevant chunks
 
             distances, indices = index.search(
-                np.array(query_embedding).astype("float32"),
+                query_embedding,
                 k=min(TOP_K, len(chunks))
             )
 
@@ -207,7 +221,7 @@ if st.button("Ask Question"):
                 [chunks[idx] for idx in indices[0]]
             )
 
-            # Prompt
+            # RAG prompt
 
             prompt = f"""
 You are a document question-answering assistant.
@@ -230,7 +244,7 @@ Question:
 Answer:
 """
 
-            # Generate answer
+            # Gemini
 
             response = client.models.generate_content(
                 model="gemini-3.1-flash-lite",
